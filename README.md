@@ -220,3 +220,5 @@ curl -s https://api.ai.internal/chat -H "X-API-Key: $KEY" -H 'Content-Type: appl
 
 Strict tool-call decoding, a Grafana dashboard as code, a pytest layer under the eval suite,
 CI, unique passwords per database, and LAN access.
+
+See [docs/SERVICE-ACCESS.md](docs/SERVICE-ACCESS.md) for service URLs and gateway setup.
