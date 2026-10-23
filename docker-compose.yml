@@ -457,7 +457,25 @@ services:
     networks:
       - enterprise-ai-mesh
 
+  # Alternative model backend. Only one backend fits on the GPU at a time,
+  # so this is off by default - scripts/switch_backend.sh starts and stops it.
+  ollama:
+    image: ollama/ollama:latest      # pin a version once you have tested it
+    container_name: ollama
+    runtime: nvidia
+    profiles: ["ollama"]             # not started by a plain docker compose up -d
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - OLLAMA_KEEP_ALIVE=24h        # keep the model loaded between requests
+      - OLLAMA_CONTEXT_LENGTH=8192
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - enterprise-ai-mesh
+    # no ports: internal only. Ollama has no authentication.
+
 volumes:
+  ollama_data:
   vllm_cache:
   grafana_data:
   code_server_config:

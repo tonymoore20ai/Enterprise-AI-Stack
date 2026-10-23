@@ -88,6 +88,7 @@ container name. That is deliberate: none of them should be exposed outside the h
 | LiteLLM | `http://litellm:4000` | other containers needing model access with LiteLLM keys |
 | Agent API | `http://agent-api:8080` | nginx (`api.ai.internal`) |
 | vLLM | `http://model-server:8000/v1` | LiteLLM only: vLLM requires `VLLM_API_KEY`, which only LiteLLM holds |
+| Ollama | `http://ollama:11434` | LiteLLM, only while the Ollama backend is active. No auth: never publish its port |
 | Vault | `http://enterprise-vault:8200` | agent (secrets) |
 | Qdrant | `http://vector-db:6333` | agent (vector memory / RAG) |
 | Redis | `agent-memory:6379` | agent state, Langfuse queues |

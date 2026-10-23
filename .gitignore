@@ -13,3 +13,5 @@ developer-workspace/.vscode/
 *.bak-*
 *.partial
 nginx/certs/*.key
+litellm/config.yaml.bak
+docker-compose.yml.pre-ollama
