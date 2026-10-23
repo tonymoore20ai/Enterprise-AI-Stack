@@ -1,0 +1,19 @@
+# Core
+openai==3.36.1
+qdrant-client==1.20.0
+redis>=5.0.0
+requests>=2.31.0
+
+# Observability
+# SDK v4 on purpose: SDK v5 needs Langfuse server >= 4.59; we run server v3.
+langfuse==4.18.0
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-http==1.45.1
+
+# Guardrails
+nemoguardrails==0.24.1
+langchain-openai==1.7.2
+
+# Chat API (agent-api service)
+fastapi==0.161.1
+uvicorn==0.54.0

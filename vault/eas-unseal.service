@@ -1,0 +1,27 @@
+# Unseals Vault for the enterprise AI stack after every boot.
+# Install (once):
+#   sudo cp vault/eas-unseal.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable eas-unseal.service
+# Logs:   journalctl -u eas-unseal.service
+
+[Unit]
+Description=Unseal Vault for the enterprise AI stack
+Wants=network-online.target
+After=docker.service network-online.target
+Requires=docker.service
+# Retry for up to ~20 minutes, then give up (check: journalctl -u eas-unseal.service)
+StartLimitIntervalSec=1200
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+User=tonymoore20
+WorkingDirectory=/home/tonymoore20/enterprise-ai-stack
+ExecStart=/home/tonymoore20/enterprise-ai-stack/vault/boot-unseal.sh
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=900
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

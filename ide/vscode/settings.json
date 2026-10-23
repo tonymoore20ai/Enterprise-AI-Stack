@@ -1,0 +1,19 @@
+{
+  // Use the agent's Python environment baked into the IDE image
+  "python.defaultInterpreterPath": "/opt/venv/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "python.testing.pytestEnabled": true,
+  "basedpyright.analysis.typeCheckingMode": "basic",
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff"
+  },
+  // Hide noise from the file tree (backups stay on disk)
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/*.bak-*": true
+  },
+  "files.watcherExclude": {
+    "**/__pycache__/**": true
+  },
+  "terminal.integrated.cwd": "/config/workspace"
+}

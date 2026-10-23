@@ -1,0 +1,11 @@
+{
+  "identities": [
+    {
+      "name": "langfuse",
+      "credentials": [
+        { "accessKey": "<S3_ACCESS_KEY from .env>", "secretKey": "<S3_SECRET_KEY from .env>" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

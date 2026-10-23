@@ -1,0 +1,7 @@
+# Never send secrets to the Docker build engine (both images build from this folder)
+.env
+secrets.txt
+vault-approle-secrets/
+nginx/certs/
+**/*.bak-*
+**/__pycache__/

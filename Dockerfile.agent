@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+
+# Build tools for packages that compile on install (NeMo pulls in annoy)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install from the same requirements file you edit in developer-workspace.
+# Copied to /tmp because /app is replaced by the workspace mount at runtime.
+COPY developer-workspace/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+WORKDIR /app
+CMD ["tail", "-f", "/dev/null"]

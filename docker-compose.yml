@@ -1,0 +1,473 @@
+# Secrets: infrastructure passwords come from .env (next to this file, mode 600,
+# never commit it). Agent secrets (Langfuse API keys) come from Vault.
+
+# All images are pinned to an exact build (name:version@sha256:digest).
+# To upgrade one: change its version AND digest together, then docker compose up -d <service>.
+
+networks:
+  enterprise-ai-mesh:
+    name: enterprise-ai-mesh
+    driver: bridge
+
+services:
+  # 1. API Gateway / TLS Proxy
+  #    https://langfuse|grafana|api|llm.ai.internal (see nginx/nginx.conf)
+  gateway:
+    image: nginx:stable-alpine@sha256:47928bf67eb62a1863cb08d9ecb52d3e704304ba614eaee17884204677702951
+    container_name: enterprise-gateway
+    restart: always
+    networks:
+      - enterprise-ai-mesh
+    ports:
+      - "127.0.0.1:443:443"   # this machine only; widen to the LAN later if wanted
+      - "127.0.0.1:80:80"     # redirects to https
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+
+  # 2. Web IDE / Dev Environment
+  #    https://code.ai.internal - runs/debugs the agent with the same Python env and services
+  vscode-ide:
+    build:
+      context: .
+      dockerfile: ide/Dockerfile.ide
+    image: enterprise-ide:latest
+    container_name: enterprise-vscode
+    restart: always
+    networks:
+      - enterprise-ai-mesh
+    environment:
+      - PUID=${HOST_UID:?run python3 ide/setup.py}      # your user: files stay yours
+      - PGID=${HOST_GID:?run python3 ide/setup.py}
+      - TZ=America/Chicago
+      - DEFAULT_WORKSPACE=/config/workspace
+      - HASHED_PASSWORD=${CODE_SERVER_HASHED_PASSWORD:?run python3 ide/setup.py}
+      # Same services as the agent, so code runs here exactly as in agent-orchestrator
+      - VAULT_ADDR=http://enterprise-vault:8200
+      - REDIS_HOST=agent-memory
+      - AGENT_MEMORY_DB=2
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+      - REDISCLI_AUTH=${REDIS_PASSWORD:?run python3 datastores/add_env.py}   # redis-cli in the terminal
+      - QDRANT_API_KEY=${QDRANT_API_KEY:?run python3 datastores/add_env.py}
+      - LLM_GATEWAY_URL=http://litellm:4000/v1
+      - LANGFUSE_HOST=http://langfuse-server:3000
+      - FASTEMBED_CACHE_PATH=/config/.cache/fastembed
+    volumes:
+      - code_server_config:/config                     # settings, extensions, shell history
+      - ./developer-workspace:/config/workspace
+      - ./vault-approle-secrets:/var/run/secrets/vault:ro   # agent's read-only Vault login
+    # no host port: reached through the gateway at https://code.ai.internal
+
+  # 3. Secret Management
+  vault:
+    image: hashicorp/vault:2.1.2
+    container_name: enterprise-vault
+    restart: always
+    command: server   # real server (file storage), no longer dev mode
+    networks:
+      - enterprise-ai-mesh
+    environment:
+      VAULT_ADDR: "http://127.0.0.1:8200"   # for the vault CLI inside the container
+    volumes:
+      - ./vault/config:/vault/config:ro
+      - vault_data:/vault/file
+    cap_add:
+      - IPC_LOCK
+    ulimits:          # let Vault lock its memory so secrets never go to swap
+      memlock:
+        soft: -1
+        hard: -1
+
+  # 4. Agentic Orchestration Engine
+  agent-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: enterprise-agent:latest   # also used by agent-api
+    container_name: agent-orchestrator
+    restart: always
+    networks:
+      - enterprise-ai-mesh
+    working_dir: /app
+    command: tail -f /dev/null
+    environment: &agent-env
+      - VAULT_ADDR=http://enterprise-vault:8200
+      - REDIS_HOST=agent-memory
+      - AGENT_MEMORY_DB=2   # agent memory; Langfuse uses Redis database 0
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+      - QDRANT_API_KEY=${QDRANT_API_KEY:?run python3 datastores/add_env.py}
+      - LLM_GATEWAY_URL=http://litellm:4000/v1   # all model calls go through LiteLLM (key from Vault)
+      - FASTEMBED_CACHE_PATH=/root/.cache/fastembed   # embedding model for RAG (CPU)
+      - LANGFUSE_HOST=http://langfuse-server:3000
+      # Langfuse API keys come from Vault (secret/agent/langfuse) via AppRole: see vault_client.py
+    volumes: &agent-volumes
+      - ./developer-workspace:/app
+      - ./vault-approle-secrets:/var/run/secrets/vault:ro
+      - fastembed_cache:/root/.cache/fastembed
+
+  # 4a. Agent chat API with Redis memory (same image and code as agent-engine)
+  agent-api:
+    image: enterprise-agent:latest
+    pull_policy: never   # built by agent-engine, never pulled
+    container_name: agent-api
+    restart: always
+    depends_on:
+      - agent-engine
+      - agent-memory
+      - litellm
+    working_dir: /app
+    command: ["uvicorn", "chat_api:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+    environment: *agent-env
+    volumes: *agent-volumes
+    ports:
+      - "127.0.0.1:8080:8080"   # localhost only until nginx fronts it with TLS + API keys
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    networks:
+      - enterprise-ai-mesh
+
+  # 5. State & Transient Task Memory (agent memory in db 2; Langfuse queue/cache in db 0)
+  agent-memory:
+    image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    container_name: agent-memory
+    restart: always
+    # password from .env; REDISCLI_AUTH lets `docker exec agent-memory redis-cli ...` work as before
+    command: ["sh", "-c", "exec redis-server --maxmemory-policy noeviction --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+      - REDISCLI_AUTH=${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+    volumes:
+      - redis_data:/data   # persists agent memory and Langfuse's queue across restarts
+    networks:
+      - enterprise-ai-mesh
+
+  # 6. Long-Term Vector Store & RAG
+  vector-db:
+    image: qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
+    container_name: agent-vector-db
+    restart: always
+    environment:
+      - QDRANT__SERVICE__API_KEY=${QDRANT_API_KEY:?run python3 datastores/add_env.py}
+    networks:
+      - enterprise-ai-mesh
+    volumes:
+      - qdrant_data:/qdrant/storage   # collections survive restarts
+
+  # 7. Enterprise Observability & Audit Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.163.2@sha256:7f22d2a6748110ffb6a59bc0df448bccbf501cdb667d610ede4c61d3863d5849
+    container_name: agent-otel
+    restart: always
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    environment:
+      - OTEL_CLICKHOUSE_PASSWORD=${OTEL_CLICKHOUSE_PASSWORD:?missing in .env}
+    volumes:
+      - ./developer-workspace/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "127.0.0.1:4317:4317"   # localhost only
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - clickhouse
+    networks:
+      - enterprise-ai-mesh
+
+  # 8. Model Inference Server (vLLM Engine on RTX 3090)
+  model-server:
+    image: vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34   # CUDA 13 build (needs driver >= 580)
+    container_name: vllm-inference
+    restart: always
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HUB_OFFLINE=1
+      - VLLM_API_KEY=${VLLM_API_KEY:?missing in .env}   # only LiteLLM has this key
+    shm_size: "8gb"   # shared memory for PyTorch workers
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - vllm_cache:/root/.cache/vllm   # torch.compile cache: restarts after the first are much faster
+    networks:
+      - enterprise-ai-mesh
+    ports:
+      - "127.0.0.1:8000:8000"   # localhost only (debugging); everything else goes through LiteLLM
+    command: >
+      --model Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+      --quantization awq_marlin
+      --host 0.0.0.0
+      --port 8000
+      --disable-custom-all-reduce
+      --gpu-memory-utilization 0.92
+      --max-model-len 4096
+      --enable-chunked-prefill
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+
+  # 9. Observability Analytics Engine (ClickHouse) - your OTel data
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3@sha256:85b97f63dcfff47790d26bb5d5801637aaddb2b93e5e9aee27a686c2fb2b9916
+    container_name: clickhouse
+    restart: always
+    ports:
+      - "127.0.0.1:8123:8123"   # localhost only
+      - "127.0.0.1:9000:9000"
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=${OTEL_CLICKHOUSE_PASSWORD:?missing in .env}
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    networks:
+      - enterprise-ai-mesh
+
+  # 10. Observability Dashboard UI (Grafana)
+  grafana:
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    container_name: enterprise-grafana
+    restart: always
+    # no host port: reached through the gateway at https://grafana.ai.internal
+    environment:
+      - GF_SERVER_ROOT_URL=https://grafana.ai.internal
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?missing in .env}
+      - GF_INSTALL_PLUGINS=grafana-clickhouse-datasource
+      - OTEL_CLICKHOUSE_PASSWORD=${OTEL_CLICKHOUSE_PASSWORD:?missing in .env}   # read by the provisioned data source
+    volumes:
+      - grafana_data:/var/lib/grafana                          # dashboards, settings, plugins survive recreates
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro    # data sources defined as code
+    depends_on:
+      - clickhouse
+    networks:
+      - enterprise-ai-mesh
+
+  # 11. S3-Compatible Object Store (SeaweedFS)
+  #     S3 listens on 9090 both inside and outside Docker, so the same port
+  #     works from containers (seaweedfs:9090) and the host (localhost:9090).
+  #     Host port 9000 is already taken by ClickHouse.
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    container_name: seaweedfs
+    restart: always
+    command: >
+      server
+      -dir=/data
+      -ip=seaweedfs
+      -ip.bind=0.0.0.0
+      -volume.max=0
+      -master.volumeSizeLimitMB=1024
+      -s3
+      -s3.port=9090
+      -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "127.0.0.1:9090:9090"   # S3 API (localhost only; Langfuse media URLs use it)
+      - "127.0.0.1:9333:9333"   # master UI (localhost only)
+    volumes:
+      - seaweed_data:/data
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    networks:
+      - enterprise-ai-mesh
+
+  # 11a. One-shot bucket creation for Langfuse
+  seaweedfs-init:
+    image: amazon/aws-cli:latest@sha256:de807aa682dd3f45d6de5f431b93762691c53f1134b318936dda39f99e321244
+    container_name: seaweedfs-init
+    depends_on:
+      - seaweedfs
+    environment:
+      - AWS_ACCESS_KEY_ID=${S3_ACCESS_KEY:?missing in .env}
+      - AWS_SECRET_ACCESS_KEY=${S3_SECRET_KEY:?missing in .env}
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until aws --endpoint-url http://seaweedfs:9090 s3 ls >/dev/null 2>&1; do
+          echo "waiting for seaweedfs..."; sleep 2;
+        done
+        aws --endpoint-url http://seaweedfs:9090 s3 mb s3://langfuse-events || true
+        aws --endpoint-url http://seaweedfs:9090 s3 mb s3://langfuse-media || true
+        aws --endpoint-url http://seaweedfs:9090 s3 ls
+    restart: "no"
+    networks:
+      - enterprise-ai-mesh
+
+  # 12. Langfuse Postgres (transactional data)
+  langfuse-db:
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    container_name: langfuse-db
+    restart: always
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=${LANGFUSE_DB_PASSWORD:?missing in .env}
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - enterprise-ai-mesh
+
+  # 13. Langfuse ClickHouse (kept separate from your OTel ClickHouse; no host ports)
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.3@sha256:85b97f63dcfff47790d26bb5d5801637aaddb2b93e5e9aee27a686c2fb2b9916
+    container_name: langfuse-clickhouse
+    restart: always
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=${LANGFUSE_CLICKHOUSE_PASSWORD:?missing in .env}
+    volumes:
+      - langfuse_ch_data:/var/lib/clickhouse
+      - langfuse_ch_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - enterprise-ai-mesh
+
+  # 14. Langfuse Web UI & Ingestion API (v3) - host port 3001 (Grafana has 3000)
+  langfuse-server:
+    image: langfuse/langfuse:3.225.11@sha256:a343f64e035eb01aeea358703a0428945d909d01e19452509a5a830862dda878
+    container_name: langfuse-server
+    restart: always
+    depends_on: &langfuse-depends
+      langfuse-db:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      agent-memory:
+        condition: service_started
+      seaweedfs-init:
+        condition: service_completed_successfully
+    # no host port: reached through the gateway at https://langfuse.ai.internal
+    environment: &langfuse-env
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:?missing in .env}@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: https://langfuse.ai.internal
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?missing in .env}
+      SALT: ${LANGFUSE_SALT:?missing in .env}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?missing in .env}
+      TELEMETRY_ENABLED: "false"
+
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:?missing in .env}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+
+      REDIS_HOST: agent-memory
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+
+      # Event storage (mandatory in v3) - internal Docker address
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse-events
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://seaweedfs:9090
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?missing in .env}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?missing in .env}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+
+      # Media storage - presigned URLs go to the SDK/browser, so this must be
+      # reachable from outside Docker. If agents inside agent-engine upload
+      # media (images/audio), replace localhost with your host's LAN IP/hostname.
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse-media
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9090
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${S3_ACCESS_KEY:?missing in .env}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:?missing in .env}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+      AUTH_DISABLE_USERNAME_PASSWORD: "false"
+      LANGFUSE_INIT_ORG_ID: ent-org
+      LANGFUSE_INIT_ORG_NAME: Enterprise AI
+      LANGFUSE_INIT_PROJECT_ID: ent-ai-mesh
+      LANGFUSE_INIT_PROJECT_NAME: Mesh Agents
+      LANGFUSE_INIT_USER_EMAIL: tony@enterprise.local
+      LANGFUSE_INIT_USER_NAME: Tony
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?missing in .env}
+    networks:
+      - enterprise-ai-mesh
+
+  # 15. Langfuse Worker - moves events from S3/Redis into ClickHouse (required in v3)
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3.225.11@sha256:8a28c946bb5401eef488153fa294db5a79bd99dd5c90db8e4d39559374c9ebd3
+    container_name: langfuse-worker
+    restart: always
+    depends_on: *langfuse-depends
+    environment: *langfuse-env
+    networks:
+      - enterprise-ai-mesh
+
+  # 16. LLM Gateway (LiteLLM): virtual keys, rate limits and model aliases in front of vLLM
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.99.4   # pinned, cosign-signed official image
+    container_name: litellm
+    restart: always
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+      model-server:
+        condition: service_started
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?missing in .env}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?missing in .env}
+      DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD:?missing in .env}@litellm-db:5432/litellm
+      VLLM_API_KEY: ${VLLM_API_KEY:?missing in .env}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    ports:
+      - "127.0.0.1:4000:4000"   # localhost only until nginx fronts it
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - enterprise-ai-mesh
+
+  # 16a. LiteLLM Postgres (virtual keys, usage per key); no host port
+  litellm-db:
+    image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+    container_name: litellm-db
+    restart: always
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${LITELLM_DB_PASSWORD:?missing in .env}
+      - POSTGRES_DB=litellm
+    volumes:
+      - litellm_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - enterprise-ai-mesh
+
+volumes:
+  vllm_cache:
+  grafana_data:
+  code_server_config:
+  redis_data:
+  litellm_pg_data:
+  vault_data:
+  qdrant_data:
+  fastembed_cache:
+  clickhouse_data:
+  seaweed_data:
+  langfuse_pg_data:
+  langfuse_ch_data:
+  langfuse_ch_logs:

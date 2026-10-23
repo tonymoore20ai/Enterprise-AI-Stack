@@ -1,0 +1,5 @@
+# Dev tools for the IDE (on top of developer-workspace/requirements.txt)
+debugpy==1.8.22      # VS Code Python debugger
+ipykernel==7.4.0     # run notebooks against the agent's environment
+ruff==0.17.2         # linter + formatter
+pytest==9.1.1        # tests

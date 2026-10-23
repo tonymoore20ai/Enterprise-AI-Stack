@@ -1,0 +1,35 @@
+# LiteLLM gateway: every model call in the stack goes through here.
+# Clients ask for an alias; this file decides which real model serves it.
+# To switch models, change the `model:` lines below and restart litellm -
+# no agent or guardrails code changes needed.
+
+model_list:
+  # Used by the weather agent (agent_loop.py)
+  - model_name: weather-agent
+    litellm_params:
+      model: hosted_vllm/Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+      api_base: http://model-server:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      timeout: 120
+
+  # Used by the NeMo self-check rails (guardrails/config.yml)
+  - model_name: guardrails
+    litellm_params:
+      model: hosted_vllm/Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+      api_base: http://model-server:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      timeout: 60
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY   # admin only; clients get virtual keys
+  database_url: os.environ/DATABASE_URL        # virtual keys + usage per key
+  store_model_in_db: false                     # models come only from this file
+  cancel_on_disconnect: true                   # free the GPU slot if a client gives up
+
+litellm_settings:
+  drop_params: true      # ignore OpenAI params vLLM doesn't support instead of failing
+  num_retries: 1
+  request_timeout: 120
+  telemetry: false       # no usage data sent to LiteLLM
+  # No Langfuse callback on purpose: the agent already traces every call itself,
+  # so logging here too would record each call twice.

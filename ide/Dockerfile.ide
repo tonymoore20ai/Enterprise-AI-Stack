@@ -1,0 +1,35 @@
+# Browser IDE (code-server) that can run and debug the agent code.
+# Same Python version (3.11) and the same libraries as the agent image, plus dev tools.
+# Rebuild after changing developer-workspace/requirements.txt or ide/requirements-dev.txt:
+#   docker compose build vscode-ide && docker compose up -d vscode-ide
+
+FROM lscr.io/linuxserver/code-server:4.141.0-ls371
+
+# uv: fast, reproducible Python + package installs
+COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /uvx /usr/local/bin/
+
+# Command-line tools for working with the stack
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl wget jq httpie \
+        postgresql-client redis-tools \
+        dnsutils iputils-ping netcat-openbsd \
+        ripgrep tree htop less unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 3.11 venv in /opt (outside /config, so it's part of the image, not the volume)
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    UV_LINK_MODE=copy \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+COPY developer-workspace/requirements.txt /tmp/requirements.txt
+COPY ide/requirements-dev.txt /tmp/requirements-dev.txt
+RUN uv python install 3.11 \
+    && uv venv /opt/venv --python 3.11 \
+    && uv pip install --python /opt/venv/bin/python --no-cache \
+         -r /tmp/requirements.txt -r /tmp/requirements-dev.txt \
+    && chmod -R a+rX /opt/venv /opt/uv-python
+
+# Install VS Code extensions on first start (runs as root; must be root-owned)
+COPY --chmod=755 ide/init-extensions.sh /custom-cont-init.d/10-extensions.sh

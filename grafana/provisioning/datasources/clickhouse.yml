@@ -1,0 +1,25 @@
+# Grafana data source for the OTel traces in ClickHouse (provisioned on every start,
+# so it can never be lost again). The password comes from the container environment
+# (OTEL_CLICKHOUSE_PASSWORD, set from .env) and is never stored in this file.
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    uid: clickhouse-otel
+    type: grafana-clickhouse-datasource
+    access: proxy
+    orgId: 1
+    isDefault: true
+    jsonData:
+      host: clickhouse
+      port: 9000
+      protocol: native
+      username: default
+      defaultDatabase: default
+      # OTel collector writes traces to default.otel_traces
+      traces:
+        defaultDatabase: default
+        defaultTable: otel_traces
+        otelEnabled: true
+    secureJsonData:
+      password: $OTEL_CLICKHOUSE_PASSWORD

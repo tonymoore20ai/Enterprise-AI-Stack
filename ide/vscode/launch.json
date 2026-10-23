@@ -1,0 +1,70 @@
+{
+  // Run and Debug configurations for the weather agent (F5, or the Run and Debug panel).
+  // Everything runs inside the IDE container with the agent's Python environment,
+  // talking to the same LiteLLM, Vault, Redis, Qdrant and Langfuse as the agent.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Agent: one question (ZIP 77469)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/agent_loop.py",
+      "cwd": "${workspaceFolder}",
+      "env": { "ZIPCODE": "77469" },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Eval: hard set (run name ide-debug)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_eval.py",
+      "args": ["--dataset", "guardrails-eval-hard", "--name", "ide-debug"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Eval: show failures of a run",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/show_failures.py",
+      "args": ["${input:runName}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Chat API (debug copy on 127.0.0.1:8081)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["chat_api:app", "--host", "127.0.0.1", "--port", "8081"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Knowledge: test a search",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ingest_knowledge.py",
+      "args": ["--test", "${input:question}"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "Python: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ],
+  "inputs": [
+    { "id": "runName", "type": "promptString", "description": "Run name", "default": "ide-debug" },
+    { "id": "question", "type": "promptString", "description": "Safety question",
+      "default": "When is it safe to go outside after thunder?" }
+  ]
+}
