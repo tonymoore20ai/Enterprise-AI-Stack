@@ -3,7 +3,7 @@
 
 prompts:
   - task: self_check_input
-    max_tokens: 3
+    max_tokens: 1024
     content: |
       Your task is to check if the user message below complies with the policy
       for talking with a weather assistant.
@@ -27,7 +27,7 @@ prompts:
       Answer with only Yes or No.
 
   - task: self_check_output
-    max_tokens: 3
+    max_tokens: 1024
     content: |
       Your task is to check if the bot message below complies with the policy.
 

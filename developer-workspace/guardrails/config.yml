@@ -10,7 +10,7 @@ models:
     parameters:
       base_url: http://litellm:4000/v1
       temperature: 0
-      max_tokens: 8
+      max_tokens: 1024
 
 rails:
   input:
