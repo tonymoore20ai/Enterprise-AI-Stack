@@ -37,7 +37,11 @@ prompts:
       - should not contain harmful, abusive, or explicit content
       - should not help track, watch, or find a specific person, or suggest visiting them
       - should not make up data that is not in a weather forecast
-      - may include safety guidance from the National Weather Service or EPA, including the
+      - may convert units (for example °C to °F) and round the numbers
+      - may give general tips that follow from the forecast (for example an umbrella when
+        rain is possible, sunscreen, water, or a jacket)
+      - may include safety guidance from the National Weather Service, EPA or a state
+        Department of Transportation (for example driving in rain), including the
         numbers in that guidance (for example heat-stroke temperatures or flood depths)
       - may advise on protecting children, older adults and pets from weather hazards
         (for example never leaving a child or pet in a hot car)

@@ -66,8 +66,14 @@ def set_trace_info(**kwargs):
             **{k: v for k, v in kwargs.items() if k in ("input", "output", "metadata")}
         )
 
-MODEL = "weather-agent"  # alias defined in litellm/config.yaml; change the real model there
+MODEL = "weather-agent"  # LiteLLM alias; it always routes to vLLM's fixed name "strategist"
+# The real model behind it, set once in docker-compose.yml (x-models) and passed in by
+# compose. Only recorded in traces and evals - the code works the same for any model.
+BACKEND_MODEL = os.environ.get("STRATEGIST_MODEL", "unknown")
 ZIPCODE = os.environ.get("ZIPCODE", "77469")
+# Per-turn output budget (reasoning + answer). The strategist runs with a 16K context,
+# so prompt + this must stay under 16384.
+AGENT_MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "4096"))
 llm = OpenAI(
     base_url=os.environ.get("LLM_GATEWAY_URL", "http://litellm:4000/v1"),
     api_key=LITELLM_KEYS["agent_key"],
@@ -319,7 +325,6 @@ def date_context() -> str:
 # ---------------------------------------------------------------------------
 # 5. Agent loop: model -> tool calls -> model ... until a final answer
 # ---------------------------------------------------------------------------
-@observe(name="weather-agent")
 def _remember(user_id, session_id, user_request, answer, with_facts=True):
     """Store an approved turn (and any facts) in Redis; never let memory break a reply."""
     if not user_id:
@@ -332,6 +337,10 @@ def _remember(user_id, session_id, user_request, answer, with_facts=True):
         print(f"[!] Memory save failed: {e}")
 
 
+# Root observation: every rail check, model turn and tool call nests under this one
+# trace. (This decorator used to sit on _remember() by mistake, which left the trace
+# unnamed with no input/output and caused the "No active span" warning.)
+@observe(name="weather-agent")
 def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
               session_id: str | None = None) -> str:
     """One turn. With user_id (+ session_id) the agent uses Redis memory; without it,
@@ -340,8 +349,10 @@ def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
     LAST_RUN["tool_outputs"].clear()
     session_id = session_id or ("default" if user_id else None)
     set_trace_info(
+        name="weather-agent",
         tags=["weather", "mesh-agents"],
-        metadata={"zipcode": ZIPCODE, "model": MODEL, "tags": "weather,mesh-agents",
+        metadata={"zipcode": ZIPCODE, "model": MODEL, "backend_model": BACKEND_MODEL,
+                  "tags": "weather,mesh-agents",
                   "memory": "on" if user_id else "off"},
         input=user_request,
     )
@@ -383,6 +394,13 @@ def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
                     "the rain chance, and one practical tip for the day. "
                     "Pass whatever location the user gave to get_weather_forecast, even if it does "
                     "not look like a valid ZIP code; the tool checks it. "
+                    "When you call search_knowledge, name the specific hazard from the forecast "
+                    "in the query (for example 'driving in rain', 'heat illness', 'lightning'), "
+                    "not a general phrase like 'current weather conditions'. "
+                    "Only attribute statements to a source (National Weather Service, EPA, a "
+                    "Department of Transportation) if search_knowledge returned them; your own "
+                    "judgment (e.g. 'conditions look "
+                    "mild') must not be credited to a source. "
                     "Whenever the user asks how to stay safe or protect someone, call search_knowledge, "
                     "even if the forecast looks mild. Also call it when the forecast suggests a hazard "
                     "(heat, storms, flooding, cold, poor air, strong sun, fog), and "
@@ -390,6 +408,8 @@ def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
                     "Service'). Do not invent safety advice that search_knowledge did not return. "
                     "If get_weather_forecast returns an error, say you couldn't find that location "
                     "and ask for a valid 5-digit US ZIP code; never guess a forecast. "
+                    "Use only the values the tools return: do not add timing (e.g. 'later in the "
+                    "day'), wind, humidity, UV or any other detail that is not in the tool output. "
                     + date_context()
                     + (" " + memory.facts_prompt(mem["facts"]) if user_id else "")
                 ),
@@ -400,16 +420,28 @@ def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
 
         forecast_ok = forecast_failed = False
         for turn in range(max_turns):
+            # Think only on the first turn (deciding which tools to call). Later turns
+            # turn tool results into a reply (or a follow-up tool call), which needs no
+            # long reasoning - skipping it cuts that turn from ~13s to a few seconds.
+            thinking = turn == 0
             resp = llm.chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 tools=TOOLS,
                 tool_choice="auto",
-                temperature=0.2,
-                max_tokens=512,
+                # Qwen3.6: 0.6 for precise thinking; greedy/near-greedy can loop
+                # later turns only reformat tool data, so keep them near-deterministic
+                temperature=0.6 if thinking else 0.1,
+                # Thinking and the answer share this budget; 512 cut the answer off.
+                max_tokens=AGENT_MAX_TOKENS,
+                extra_body={"chat_template_kwargs": {"enable_thinking": thinking}},
                 name=f"agent-turn-{turn + 1}",  # label shown in Langfuse
+                metadata={"thinking": thinking, "backend_model": BACKEND_MODEL},
             )
             msg = resp.choices[0].message
+            if resp.choices[0].finish_reason == "length":
+                print(f"[!] Turn {turn + 1} hit max_tokens={AGENT_MAX_TOKENS}; "
+                      "the reply may be cut off")
 
             if msg.tool_calls:
                 tool_calls = [tc.model_dump() for tc in msg.tool_calls]
@@ -418,7 +450,7 @@ def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
                 tool_calls = extract_text_tool_calls(msg.content)
                 content = ""  # the text WAS the tool call
                 if tool_calls:
-                    print("[*] Parsed tool call from model text (hermes parser missed it)")
+                    print("[*] Parsed tool call from model text (tool parser missed it)")
 
             if not tool_calls:
                 if forecast_failed and not forecast_ok:
@@ -432,6 +464,7 @@ def run_agent(user_request: str, max_turns: int = 5, user_id: str | None = None,
                 verdict = check_output(user_request, answer)
                 if verdict["blocked"]:
                     print(f"[!] Output rail blocked the answer ({', '.join(verdict['rails'])})")
+                    print(f"[!] Blocked answer was:\n{answer.strip()}")
                     set_trace_info(output=REFUSAL, metadata={"guardrail": "output_blocked"})
                     return REFUSAL
                 print("[*] Output rail: allowed")
