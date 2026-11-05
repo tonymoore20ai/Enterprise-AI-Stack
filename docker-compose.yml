@@ -4,6 +4,20 @@
 # All images are pinned to an exact build (name:version@sha256:digest).
 # To upgrade one: change its version AND digest together, then docker compose up -d <service>.
 
+# ---------------------------------------------------------------------------
+# MODELS - the one place to change which model serves each role.
+#   vLLM (model-server) loads it, and the agent containers and IDE receive it as
+#   STRATEGIST_MODEL, so Langfuse traces and eval runs record which model ran.
+#   LiteLLM and the code never need to change: they only use the fixed served name
+#   "strategist" and the aliases weather-agent / guardrails.
+# To switch: download the new model (hf download <repo>), change the line below,
+# adjust any model-specific flags in model-server's command, then:
+#   docker compose up -d model-server agent-engine agent-api vscode-ide
+# ---------------------------------------------------------------------------
+x-models:
+  strategist: &strategist-model QuantTrio/Qwen3.6-27B-AWQ
+  coder: &coder-model cyankiwi/Qwen3.5-9B-AWQ-BF16-INT4   # model-server-2 (RTX 5060 Ti)
+
 networks:
   enterprise-ai-mesh:
     name: enterprise-ai-mesh
@@ -36,22 +50,23 @@ services:
     restart: always
     networks:
       - enterprise-ai-mesh
-    environment:
-      - PUID=${HOST_UID:?run python3 ide/setup.py}      # your user: files stay yours
-      - PGID=${HOST_GID:?run python3 ide/setup.py}
-      - TZ=America/Chicago
-      - DEFAULT_WORKSPACE=/config/workspace
-      - HASHED_PASSWORD=${CODE_SERVER_HASHED_PASSWORD:?run python3 ide/setup.py}
+    environment:   # KEY: value form so the model anchor above can be used
+      PUID: ${HOST_UID:?run python3 ide/setup.py}      # your user: files stay yours
+      PGID: ${HOST_GID:?run python3 ide/setup.py}
+      TZ: America/Chicago
+      DEFAULT_WORKSPACE: /config/workspace
+      HASHED_PASSWORD: ${CODE_SERVER_HASHED_PASSWORD:?run python3 ide/setup.py}
       # Same services as the agent, so code runs here exactly as in agent-orchestrator
-      - VAULT_ADDR=http://enterprise-vault:8200
-      - REDIS_HOST=agent-memory
-      - AGENT_MEMORY_DB=2
-      - REDIS_PASSWORD=${REDIS_PASSWORD:?run python3 datastores/add_env.py}
-      - REDISCLI_AUTH=${REDIS_PASSWORD:?run python3 datastores/add_env.py}   # redis-cli in the terminal
-      - QDRANT_API_KEY=${QDRANT_API_KEY:?run python3 datastores/add_env.py}
-      - LLM_GATEWAY_URL=http://litellm:4000/v1
-      - LANGFUSE_HOST=http://langfuse-server:3000
-      - FASTEMBED_CACHE_PATH=/config/.cache/fastembed
+      VAULT_ADDR: http://enterprise-vault:8200
+      REDIS_HOST: agent-memory
+      AGENT_MEMORY_DB: "2"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?run python3 datastores/add_env.py}   # redis-cli in the terminal
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?run python3 datastores/add_env.py}
+      LLM_GATEWAY_URL: http://litellm:4000/v1
+      LANGFUSE_HOST: http://langfuse-server:3000
+      FASTEMBED_CACHE_PATH: /config/.cache/fastembed
+      STRATEGIST_MODEL: *strategist-model   # from x-models at the top; recorded in traces
     volumes:
       - code_server_config:/config                     # settings, extensions, shell history
       - ./developer-workspace:/config/workspace
@@ -90,15 +105,16 @@ services:
       - enterprise-ai-mesh
     working_dir: /app
     command: tail -f /dev/null
-    environment: &agent-env
-      - VAULT_ADDR=http://enterprise-vault:8200
-      - REDIS_HOST=agent-memory
-      - AGENT_MEMORY_DB=2   # agent memory; Langfuse uses Redis database 0
-      - REDIS_PASSWORD=${REDIS_PASSWORD:?run python3 datastores/add_env.py}
-      - QDRANT_API_KEY=${QDRANT_API_KEY:?run python3 datastores/add_env.py}
-      - LLM_GATEWAY_URL=http://litellm:4000/v1   # all model calls go through LiteLLM (key from Vault)
-      - FASTEMBED_CACHE_PATH=/root/.cache/fastembed   # embedding model for RAG (CPU)
-      - LANGFUSE_HOST=http://langfuse-server:3000
+    environment: &agent-env   # KEY: value form so the model anchor above can be used
+      VAULT_ADDR: http://enterprise-vault:8200
+      REDIS_HOST: agent-memory
+      AGENT_MEMORY_DB: "2"   # agent memory; Langfuse uses Redis database 0
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?run python3 datastores/add_env.py}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?run python3 datastores/add_env.py}
+      LLM_GATEWAY_URL: http://litellm:4000/v1   # all model calls go through LiteLLM (key from Vault)
+      FASTEMBED_CACHE_PATH: /root/.cache/fastembed   # embedding model for RAG (CPU)
+      LANGFUSE_HOST: http://langfuse-server:3000
+      STRATEGIST_MODEL: *strategist-model   # from x-models at the top; recorded in traces/evals
       # Langfuse API keys come from Vault (secret/agent/langfuse) via AppRole: see vault_client.py
     volumes: &agent-volumes
       - ./developer-workspace:/app
@@ -175,35 +191,94 @@ services:
     networks:
       - enterprise-ai-mesh
 
-  # 8. Model Inference Server (vLLM Engine on RTX 3090)
+  # 8. Model Inference Server (vLLM Engine on RTX 3090) — strategist
   model-server:
-    image: vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34   # CUDA 13 build (needs driver >= 580)
+    image: vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
     container_name: vllm-inference
     restart: always
     runtime: nvidia
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_VISIBLE_DEVICES=${GPU_3090_UUID:?missing in .env}   # pin to the 3090 only
       - HF_HUB_OFFLINE=1
       - VLLM_API_KEY=${VLLM_API_KEY:?missing in .env}   # only LiteLLM has this key
-    shm_size: "8gb"   # shared memory for PyTorch workers
+    shm_size: "8gb"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
-      - vllm_cache:/root/.cache/vllm   # torch.compile cache: restarts after the first are much faster
+      - vllm_cache:/root/.cache/vllm
     networks:
       - enterprise-ai-mesh
     ports:
-      - "127.0.0.1:8000:8000"   # localhost only (debugging); everything else goes through LiteLLM
-    command: >
-      --model Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
-      --quantization awq_marlin
-      --host 0.0.0.0
-      --port 8000
-      --disable-custom-all-reduce
-      --gpu-memory-utilization 0.92
-      --max-model-len 4096
-      --enable-chunked-prefill
-      --enable-auto-tool-choice
-      --tool-call-parser hermes
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 600s   # first start compiles + captures CUDA graphs
+    command:
+      - *strategist-model                   # set in x-models at the top of this file
+      # Fixed - keep these whatever the model:
+      - --served-model-name=strategist      # the name LiteLLM routes to; never change
+      - --host=0.0.0.0
+      - --port=8000
+      - --enable-prefix-caching
+      - --enable-auto-tool-choice
+      # Model-specific - check these when switching models:
+      # Fixed KV-cache size (0.93 GiB) instead of a % of the GPU: a % lets vLLM's
+      # estimate grab too much cache and run out of memory during CUDA graph capture.
+      # 0.93 GiB is vLLM's own "fully use the GPU" value for this model + display;
+      # 0.85 GiB was too small for a 16K context (only 0.81 GiB usable after rounding).
+      - --kv-cache-memory=1002173952
+      - --max-model-len=16384
+      - --kv-cache-dtype=fp8
+      - --max-num-batched-tokens=2048
+      - --max-num-seqs=1
+      - --language-model-only               # multimodal Qwen3.6: skip the vision encoder
+      - --reasoning-parser=qwen3            # thinking models only
+      - --tool-call-parser=qwen3_coder      # matches the model family (hermes for Qwen2.5)
+
+  # 8a. Second Inference Server (vLLM Engine on RTX 5060 Ti) - coder
+  #     Shares this card with the desktop, so the KV cache is a fixed size.
+  model-server-2:
+    image: vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+    container_name: vllm-inference-coder
+    restart: always
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${GPU_5060TI_UUID:?missing in .env}   # pin to the 5060 Ti only
+      - HF_HUB_OFFLINE=1
+      - VLLM_API_KEY=${VLLM_API_KEY:?missing in .env}   # only LiteLLM has this key
+    shm_size: "8gb"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - vllm_cache_coder:/root/.cache/vllm
+    networks:
+      - enterprise-ai-mesh
+    ports:
+      - "127.0.0.1:8001:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 600s   # first start compiles + captures CUDA graphs
+    command:
+      - *coder-model                        # set in x-models at the top of this file
+      # Fixed - keep these whatever the model:
+      - --served-model-name=coder           # the name LiteLLM routes to; never change
+      - --host=0.0.0.0
+      - --port=8000
+      - --enable-prefix-caching
+      - --enable-auto-tool-choice
+      # Model-specific - check these when switching models:
+      - --kv-cache-memory=3221225472        # 3 GiB starting value: adjust from vLLM's startup log
+      - --max-model-len=32768
+      - --kv-cache-dtype=fp8
+      - --max-num-batched-tokens=2048
+      - --max-num-seqs=1
+      - --language-model-only               # skip the vision encoder
+      - --reasoning-parser=qwen3
+      - --tool-call-parser=qwen3_coder
 
   # 9. Observability Analytics Engine (ClickHouse) - your OTel data
   clickhouse:
@@ -457,7 +532,7 @@ services:
     networks:
       - enterprise-ai-mesh
 
-  # Alternative model backend. Only one backend fits on the GPU at a time,
+  # Alternative model backend, on either GPU. It replaces that GPU's vLLM server,
   # so this is off by default - scripts/switch_backend.sh starts and stops it.
   ollama:
     image: ollama/ollama:latest      # pin a version once you have tested it
@@ -465,7 +540,8 @@ services:
     runtime: nvidia
     profiles: ["ollama"]             # not started by a plain docker compose up -d
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+      # scripts/switch_backend.sh picks the GPU; a plain start uses the 3090
+      - NVIDIA_VISIBLE_DEVICES=${OLLAMA_GPU_UUID:-${GPU_3090_UUID:?missing in .env}}
       - OLLAMA_KEEP_ALIVE=24h        # keep the model loaded between requests
       - OLLAMA_CONTEXT_LENGTH=8192
     volumes:
@@ -477,6 +553,7 @@ services:
 volumes:
   ollama_data:
   vllm_cache:
+  vllm_cache_coder:
   grafana_data:
   code_server_config:
   redis_data:

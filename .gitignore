@@ -4,6 +4,7 @@ secrets.txt
 vault-approle-secrets/
 seaweedfs/s3.json
 nginx/certs/
+developer-workspace/HF Read Token hf.txt
 
 # --- Generated / local ------------------------------------------------------
 __pycache__/
@@ -15,3 +16,4 @@ developer-workspace/.vscode/
 nginx/certs/*.key
 litellm/config.yaml.bak
 docker-compose.yml.pre-ollama
+*.bak

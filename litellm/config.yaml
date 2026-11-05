@@ -1,13 +1,13 @@
 # LiteLLM gateway: every model call in the stack goes through here.
-# Clients ask for an alias; this file decides which real model serves it.
-# To switch models, change the `model:` lines below and restart litellm -
-# no agent or guardrails code changes needed.
+# Clients ask for an alias; each alias routes to a vLLM fixed served name:
+# "strategist" (model-server) or "coder" (model-server-2). To switch models,
+# change x-models in docker-compose.yml only - nothing in this file needs to change.
 
 model_list:
   # Used by the weather agent (agent_loop.py)
   - model_name: weather-agent
     litellm_params:
-      model: hosted_vllm/Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+      model: hosted_vllm/strategist
       api_base: http://model-server:8000/v1
       api_key: os.environ/VLLM_API_KEY
       timeout: 120
@@ -15,10 +15,22 @@ model_list:
   # Used by the NeMo self-check rails (guardrails/config.yml)
   - model_name: guardrails
     litellm_params:
-      model: hosted_vllm/Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+      model: hosted_vllm/strategist
       api_base: http://model-server:8000/v1
       api_key: os.environ/VLLM_API_KEY
       timeout: 60
+      max_tokens: 16
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: false
+
+  # Coding model on the RTX 5060 Ti (model-server-2)
+  - model_name: coder
+    litellm_params:
+      model: hosted_vllm/coder
+      api_base: http://model-server-2:8000/v1
+      api_key: os.environ/VLLM_API_KEY
+      timeout: 120
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY   # admin only; clients get virtual keys
